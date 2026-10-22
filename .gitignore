@@ -28,3 +28,15 @@ web/build
 
 # Local docker-compose overrides
 docker-compose.override.yml
+
+# Server-only secrets
+.env
+.env.*
+.venv-*
+__pycache__/
+/credentials/
+/backups/
+
+# Operator-specific deployment and runbook; publish generic examples instead.
+/compose.yaml
+/docs/OPERATIONS.md

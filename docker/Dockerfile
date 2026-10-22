@@ -34,7 +34,9 @@ RUN if [ "$SKIP_WEB_BUILD" = "true" ] && [ -d build ]; then \
     fi
 
 # ---------- chef: shared base with cargo-chef installed ----------
-FROM rust:1-slim AS chef
+FROM rust:1-slim-bookworm AS chef
+# Match the Debian 12 runtime's libc and bound build load on shared hosts.
+ARG CARGO_BUILD_JOBS=2
 RUN cargo install --locked cargo-chef --version ^0.1
 WORKDIR /build
 
@@ -50,13 +52,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --bin errexd
+RUN cargo chef cook --locked --release --recipe-path recipe.json --bin errexd
 
 COPY . .
 # rust-embed reads $CARGO_MANIFEST_DIR/../../web/build/ at compile time, so
 # the SPA must be in place before cargo runs.
 COPY --from=web-builder /web/build /build/web/build
-RUN cargo build --release --bin errexd \
+RUN cargo build --locked --release --bin errexd \
  && strip target/release/errexd
 
 # Stage out the data dir into a scratch tree the distroless runtime can

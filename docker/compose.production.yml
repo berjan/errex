@@ -1,0 +1,45 @@
+# Opt-in hardened deployment; the default development compose is unchanged.
+name: errex
+services:
+  errexd:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        CARGO_BUILD_JOBS: "2"
+    image: errex:local
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 128
+    stop_grace_period: 30s
+    ports:
+      - "127.0.0.1:${ERREX_HTTP_PORT:-9510}:9090"
+    volumes:
+      - ../data:/data
+    environment:
+      ERREX_DATA_DIR: /data/store
+      ERREX_HOST: 0.0.0.0
+      ERREX_PORT: "9090"
+      ERREX_MCP_HOST: 127.0.0.1
+      ERREX_PUBLIC_URL: ${ERREX_PUBLIC_URL:-http://localhost:9510}
+      ERREX_REQUIRE_AUTH: "true"
+      ERREX_DEV_MODE: "false"
+      ERREX_RETENTION_DAYS: "30"
+      ERREX_RATE_LIMIT_PER_MIN: ${ERREX_RATE_LIMIT_PER_MIN:-300}
+      ERREX_ADMIN_TOKEN: ${ERREX_ADMIN_TOKEN:?Supply a random bootstrap token}
+    healthcheck:
+      test: [CMD, /usr/local/bin/errexd, healthcheck]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

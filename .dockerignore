@@ -8,6 +8,16 @@ docker-compose.override.yml
 *.db-shm
 *.db-wal
 .DS_Store
+.env
+.env.*
+**/.env
+**/.env.*
+credentials
+.venv-*
+**/__pycache__
+backups
+compose.yaml
+docs/OPERATIONS.md
 
 # Heavy intermediates that the Dockerfile re-creates from scratch — never
 # worth shipping into the build context. We deliberately do NOT exclude
