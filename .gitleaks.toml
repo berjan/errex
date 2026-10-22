@@ -1,0 +1,15 @@
+[extend]
+useDefault = true
+
+# Exact, publicly known test values only; never exclude whole test directories.
+[[allowlists]]
+description = "RFC 6455 WebSocket example nonce (not an API credential)"
+condition = "AND"
+paths = ['''(^|/)scripts/smoke\.sh$''']
+regexes = ['''dGhlIHNhbXBsZSBub25jZQ==''']
+
+[[allowlists]]
+description = "Synthetic password in a mocked frontend login assertion"
+condition = "AND"
+paths = ['''(^|/)web/src/lib/api\.test\.ts$''']
+regexes = ['''pw12345678901''']
