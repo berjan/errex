@@ -65,7 +65,11 @@ enum ProjectCmd {
     Add {
         name: String,
         /// Public URL the SDK should target. Defaults to the local daemon.
-        #[arg(long, default_value = "http://localhost:9090")]
+        #[arg(
+            long,
+            env = "ERREX_PUBLIC_URL",
+            default_value = "http://localhost:9090"
+        )]
         public_url: String,
     },
     /// List projects with their tokens. For self-host pequeno only — never
@@ -138,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
     // which is preferable to backpressuring digest.
     let (webhook_tx, webhook_rx) = mpsc::channel(WEBHOOK_CHANNEL_CAPACITY);
 
-    let digest_handle = {
+    let mut digest_handle = {
         let store = store.clone();
         let fanout = fanout_tx.clone();
         let webhooks = webhook_tx.clone();
@@ -173,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
     });
     // The WS fan-out is mounted on the HTTP listener via axum (see
     // crate::ws), so there's no separate task to spawn here.
-    let http_handle = tokio::spawn(ingest::serve(cfg.http_addr(), http_state));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut http_handle = tokio::spawn(ingest::serve(cfg.http_addr(), http_state, shutdown_rx));
     let mcp_handle = tokio::spawn(mcp::serve(cfg.mcp_addr()));
     let retention_handle = {
         let store = store.clone();
@@ -208,12 +213,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Block on either Ctrl-C or any subsystem error.
     tokio::select! {
-        res = http_handle => res.context("http task panicked")?.context("http server")?,
+        res = &mut http_handle => res.context("http task panicked")?.context("http server")?,
         res = mcp_handle => res.context("mcp task panicked")?.context("mcp server")?,
-        res = digest_handle => res.context("digest task panicked")?.context("digest")?,
+        res = &mut digest_handle => res.context("digest task panicked")?.context("digest")?,
         res = retention_handle => res.context("retention task panicked")?,
         res = webhook_handle => res.context("webhook task panicked")?,
-        _ = shutdown_signal() => tracing::info!("shutdown signal received"),
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown: finishing in-flight ingestion");
+            let _ = shutdown_tx.send(());
+            if tokio::time::timeout(std::time::Duration::from_secs(20), &mut http_handle).await.is_err() {
+                http_handle.abort();
+            }
+            drop(event_tx);
+            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut digest_handle).await.is_err() {
+                digest_handle.abort();
+            }
+            // Undelivered notifications remain in the SQLite outbox.
+        },
     }
 
     Ok(())

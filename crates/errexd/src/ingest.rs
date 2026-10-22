@@ -259,7 +259,11 @@ base-uri 'none'; \
 form-action 'self'; \
 object-src 'none'";
 
-pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<(), DaemonError> {
+pub async fn serve(
+    addr: SocketAddr,
+    state: Arc<AppState>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), DaemonError> {
     let dev_mode = state.dev_mode;
     let mut app = build_router(state);
 
@@ -290,6 +294,9 @@ pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<(), DaemonE
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async {
+        let _ = shutdown.await;
+    })
     .await
     .map_err(DaemonError::Io)?;
     Ok(())
@@ -1039,11 +1046,20 @@ async fn ingest_envelope(
         state.metrics.inc_rejected_rate_limit();
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
-    let raw = match maybe_gunzip(&body) {
+    let decoded = if headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        == Some("br")
+    {
+        decode_brotli(&body)
+    } else {
+        maybe_gunzip(&body)
+    };
+    let raw = match decoded {
         Ok(v) => v,
         Err(err) => {
-            tracing::warn!(%err, "ingest: failed to gunzip envelope");
-            return (StatusCode::BAD_REQUEST, "invalid gzip").into_response();
+            tracing::warn!(%err, "ingest: failed to decompress envelope");
+            return (StatusCode::BAD_REQUEST, "invalid compressed envelope").into_response();
         }
     };
 
@@ -1064,11 +1080,21 @@ async fn ingest_envelope(
     }
 
     for event in events {
-        let rec = crate::digest::prepare(project.clone(), event);
-        if state.events.send(rec).await.is_err() {
-            // Digest receiver gone = shutting down. Don't bump telemetry
-            // for a request we didn't actually accept.
-            return (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
+        let mut rec = crate::digest::prepare(project.clone(), event);
+        let (ack, committed) = tokio::sync::oneshot::channel();
+        rec.committed = Some(ack);
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            state.events.send(rec).await.map_err(|_| ())?;
+            committed.await.map_err(|_| ())?
+        })
+        .await;
+        if !matches!(accepted, Ok(Ok(()))) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("retry-after", "1")],
+                "event not confirmed durable",
+            )
+                .into_response();
         }
         state.metrics.inc_accepted();
     }
@@ -1096,19 +1122,37 @@ const MAX_DECOMPRESSED: usize = 8 * 1024 * 1024;
 /// expands ~1024:1) cannot exhaust memory.
 fn maybe_gunzip(body: &[u8]) -> std::io::Result<Vec<u8>> {
     if body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b {
-        let mut out = Vec::with_capacity(4096);
-        let mut limited = GzDecoder::new(body).take((MAX_DECOMPRESSED as u64) + 1);
-        limited.read_to_end(&mut out)?;
-        if out.len() > MAX_DECOMPRESSED {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "decompressed payload exceeds limit",
-            ));
-        }
-        Ok(out)
+        read_compressed(GzDecoder::new(body))
     } else {
         Ok(body.to_vec())
     }
+}
+
+fn read_compressed(reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(4096);
+    reader
+        .take((MAX_DECOMPRESSED as u64) + 1)
+        .read_to_end(&mut out)?;
+    if out.len() > MAX_DECOMPRESSED {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decompressed payload exceeds limit",
+        ));
+    }
+    Ok(out)
+}
+
+fn decode_brotli(body: &[u8]) -> std::io::Result<Vec<u8>> {
+    // RFC 7932 reserves WBITS 0b0010001. The library enables a nonstandard
+    // large-window extension there by default; reject it before allocation.
+    // Standard windows are at most 16 MiB; output is separately capped at 8 MiB.
+    if body.first().is_some_and(|b| b & 0x7f == 0x11) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "nonstandard Brotli window",
+        ));
+    }
+    read_compressed(brotli_decompressor::Decompressor::new(body, 4096))
 }
 
 /// Parse a Sentry envelope and return the event payloads it contains.
@@ -1165,7 +1209,9 @@ fn parse_envelope(raw: &[u8]) -> Result<Vec<Event>, ProtoError> {
 
         let payload = &raw[cursor..payload_end];
         if item_type == "event" {
-            let mut event: Event = serde_json::from_slice(payload)?;
+            let mut value: Value = serde_json::from_slice(payload)?;
+            scrub_sensitive(&mut value);
+            let mut event: Event = serde_json::from_value(value)?;
             crate::user_agent::augment_tags_from_user_agent(&mut event);
             events.push(event);
         }
@@ -1178,6 +1224,58 @@ fn parse_envelope(raw: &[u8]) -> Result<Vec<Event>, ProtoError> {
     }
 
     Ok(events)
+}
+
+/// Defense in depth, not a guarantee of PII removal from free-form strings.
+/// Preserve useful locals while filtering common credential and identity keys.
+fn scrub_sensitive(value: &mut Value) {
+    scrub_sensitive_context(value, false);
+}
+
+fn scrub_sensitive_context(value: &mut Value, pairs: bool) {
+    fn sensitive(key: &str) -> bool {
+        let key = key.to_ascii_lowercase().replace('-', "_");
+        [
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "authorization",
+            "cookie",
+            "api_key",
+            "apikey",
+            "dsn",
+            "sessionid",
+        ]
+        .iter()
+        .any(|part| key.contains(part))
+            || matches!(key.as_str(), "email" | "ip_address" | "remote_addr")
+    }
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if sensitive(key) {
+                    *value = Value::String("[Filtered]".into());
+                } else {
+                    scrub_sensitive_context(
+                        value,
+                        matches!(key.as_str(), "headers" | "tags" | "data"),
+                    );
+                }
+            }
+        }
+        Value::Array(items) => {
+            // Sentry headers, tags and some request data use [name, value].
+            if pairs && items.len() == 2 && items[0].as_str().is_some_and(sensitive) {
+                items[1] = Value::String("[Filtered]".into());
+            } else {
+                for item in items {
+                    scrub_sensitive_context(item, pairs);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Returns `(line_end_exclusive_of_newline_position, next_cursor)`. Both are
@@ -1201,6 +1299,45 @@ mod tests {
 
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn migration_brotli_rejects_large_window_header_before_body() {
+        // Nonstandard 1 GiB window: reject the header, not a later EOF.
+        let err = decode_brotli(&[17, 30]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "nonstandard Brotli window");
+    }
+
+    #[test]
+    fn migration_scrubbing_preserves_fingerprint_and_log_parameters() {
+        let mut value = serde_json::json!({
+            "fingerprint": ["password-reset", "tenant-a"],
+            "logentry": {"params": ["token refresh", "failed"]},
+            "request": {"headers": [["Authorization", "private"]]}
+        });
+        scrub_sensitive(&mut value);
+        assert_eq!(value["fingerprint"][1], "tenant-a");
+        assert_eq!(value["logentry"]["params"][1], "failed");
+        assert_eq!(value["request"]["headers"][0][1], "[Filtered]");
+    }
+
+    #[test]
+    fn migration_scrubs_sensitive_fields_before_storage() {
+        let payload = serde_json::json!({"message":"safe", "user":{"email":"private@example.com"},
+            "request":{"headers":[["Authorization","Bearer secret"],["Accept","application/json"]],"cookies":"session=secret"},
+            "extra":{"api_key":"private", "job":"123"},
+            "exception":{"values":[{"stacktrace":{"frames":[{"vars":{"password":"secret", "job":"123"}}]}}]}});
+        let raw = format!("{{}}\n{{\"type\":\"event\"}}\n{payload}\n");
+        let stored = serde_json::to_value(&parse_envelope(raw.as_bytes()).unwrap()[0]).unwrap();
+        assert_eq!(stored["user"]["email"], "[Filtered]");
+        assert_eq!(stored["extra"]["api_key"], "[Filtered]");
+        assert_eq!(stored["request"]["headers"][0][1], "[Filtered]");
+        assert_eq!(stored["extra"]["job"], "123");
+        assert_eq!(
+            stored["exception"]["values"][0]["stacktrace"]["frames"][0]["vars"]["password"],
+            "[Filtered]"
+        );
+    }
 
     fn header() -> &'static str {
         r#"{"event_id":"abc","sent_at":"2026-01-01T00:00:00Z"}"#

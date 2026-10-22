@@ -20,6 +20,38 @@ fn fixed_ts() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
 }
 
+#[test]
+fn migration_preserves_sdk_debugging_fields() {
+    let raw = json!({
+        "fingerprint": ["billing", "{{ default }}"],
+        "logentry": {"message": "Failed %s", "formatted": "Failed job", "params": ["job"]},
+        "sdk": {"name": "sentry.python", "version": "test"},
+        "exception": {"values": [{"type": "RuntimeError", "mechanism": {"handled": false},
+            "stacktrace": {"frames": [{"filename": "app.py", "vars": {"job": "123"},
+                "context_line": "raise RuntimeError()", "pre_context": ["try:"], "post_context": []}]}}]}
+    });
+    let event: Event = serde_json::from_value(raw.clone()).unwrap();
+    let stored = serde_json::to_value(event).unwrap();
+    for field in ["fingerprint", "logentry", "sdk"] {
+        assert_eq!(stored[field], raw[field], "lost {field}");
+    }
+    let ex = &stored["exception"]["values"][0];
+    assert_eq!(ex["mechanism"]["handled"], false);
+    let frame = &ex["stacktrace"]["frames"][0];
+    assert_eq!(frame["vars"]["job"], "123");
+    assert_eq!(frame["context_line"], "raise RuntimeError()");
+    assert_eq!(frame["pre_context"], json!(["try:"]));
+}
+
+#[test]
+fn migration_logentry_is_used_as_title() {
+    let event: Event = serde_json::from_value(json!({"logentry": {
+        "message": "Failed %s", "formatted": "Failed job"
+    }}))
+    .unwrap();
+    assert_eq!(event.title(), "Failed job");
+}
+
 // ----- Event -----
 
 #[test]
@@ -333,6 +365,12 @@ fn client_message_ping_round_trips() {
 #[test]
 fn types_are_reexported_from_crate_root() {
     let _ = Uuid::new_v4();
-    let _ = ExceptionContainer { values: vec![] };
-    let _ = Stacktrace { frames: vec![] };
+    let _ = ExceptionContainer {
+        additional: Default::default(),
+        values: vec![],
+    };
+    let _ = Stacktrace {
+        additional: Default::default(),
+        frames: vec![],
+    };
 }

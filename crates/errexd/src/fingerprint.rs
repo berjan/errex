@@ -1,55 +1,79 @@
 //! Fingerprint derivation for grouping similar events.
 //!
-//! Strategy is deliberately naive for the scaffold: hash the exception type
-//! plus the topmost in-app frame (function + filename). Real Sentry-style
-//! grouping needs more nuance (module normalization, frame-skip rules,
-//! message templating), and that work belongs in a dedicated module.
+//! Stable SHA-256 grouping by explicit SDK fingerprint or exception + in-app
+//! frame. Log events use their message template, not changing parameters.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use errex_proto::{Event, Fingerprint};
 
 pub fn derive(event: &Event) -> Fingerprint {
-    let mut h = DefaultHasher::new();
-
-    if let Some(ex) = event.primary_exception() {
-        ex.ty.hash(&mut h);
-        if let Some(frame) = ex.first_frame() {
-            frame.function.hash(&mut h);
-            frame.filename.hash(&mut h);
-        }
-    } else if let Some(msg) = &event.message {
-        msg.hash(&mut h);
+    let default = if let Some(ex) = event.primary_exception() {
+        let frame = ex.first_frame();
+        json!([
+            "exception",
+            ex.ty,
+            frame.and_then(|f| f.function.as_ref()),
+            frame.and_then(|f| f.filename.as_ref())
+        ])
+    } else if let Some(msg) = event.log_message(true).or(event.message.as_deref()) {
+        json!(["message", msg])
     } else {
-        // Nothing distinguishing — fall back to event id so each event is its
-        // own group rather than collapsing all unknown events together.
-        event.event_id.hash(&mut h);
-    }
-
-    Fingerprint::new(format!("{:016x}", h.finish()))
+        json!(["event", event.event_id])
+    };
+    let key = match event
+        .additional
+        .get("fingerprint")
+        .and_then(|v| v.as_array())
+    {
+        Some(parts) if !parts.is_empty() && parts.iter().all(|p| p.is_string()) => {
+            json!([
+                "custom",
+                parts
+                    .iter()
+                    .map(|p| {
+                        if p.as_str() == Some("{{ default }}") {
+                            default.clone()
+                        } else {
+                            p.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            ])
+        }
+        _ => default,
+    };
+    Fingerprint::new(format!("{:x}", Sha256::digest(key.to_string().as_bytes())))
 }
 
 #[cfg(test)]
 mod tests {
     //! Fingerprint behavior tests. We pin the *contract* (what produces
-    //! equal vs distinct fingerprints) rather than concrete hash values,
-    //! because `DefaultHasher` is intentionally not stable across Rust
-    //! versions — a SHA-256 / blake3 cutover later will change values
-    //! without breaking any of these assertions.
-    //!
-    //! Stability across Rust versions is itself a TODO (see issue tracker):
-    //! once the daemon stores issues persistently across upgrades, the
-    //! fingerprint algorithm must be deterministic across compiler bumps
-    //! or grouping would silently fragment.
+    //! equal vs distinct fingerprints). SHA-256 over JSON arrays gives a
+    //! platform-independent encoding without ambiguous string concatenation.
 
     use super::*;
     use chrono::Utc;
     use errex_proto::{ExceptionContainer, ExceptionInfo, Frame, Stacktrace};
     use uuid::Uuid;
 
+    #[test]
+    fn migration_custom_fingerprints_and_logging_templates() {
+        let event = |raw| serde_json::from_value::<Event>(raw).unwrap();
+        let a = event(serde_json::json!({"message":"same", "fingerprint":["A"]}));
+        let b = event(serde_json::json!({"message":"same", "fingerprint":["B"]}));
+        assert_ne!(derive(&a), derive(&b));
+        let log_a =
+            event(serde_json::json!({"logentry":{"message":"Failed %s", "formatted":"Failed A"}}));
+        let log_b =
+            event(serde_json::json!({"logentry":{"message":"Failed %s", "formatted":"Failed B"}}));
+        assert_eq!(derive(&log_a), derive(&log_b));
+    }
+
     fn ev_with_exception(ty: &str, function: &str, filename: &str, lineno: u32) -> Event {
         Event {
+            additional: Default::default(),
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             platform: None,
@@ -59,12 +83,16 @@ mod tests {
             server_name: None,
             message: None,
             exception: Some(ExceptionContainer {
+                additional: Default::default(),
                 values: vec![ExceptionInfo {
+                    additional: Default::default(),
                     ty: Some(ty.into()),
                     value: None,
                     module: None,
                     stacktrace: Some(Stacktrace {
+                        additional: Default::default(),
                         frames: vec![Frame {
+                            additional: Default::default(),
                             filename: Some(filename.into()),
                             function: Some(function.into()),
                             module: None,
@@ -86,6 +114,7 @@ mod tests {
 
     fn ev_message(msg: &str) -> Event {
         Event {
+            additional: Default::default(),
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             platform: None,
@@ -106,6 +135,7 @@ mod tests {
 
     fn ev_empty() -> Event {
         Event {
+            additional: Default::default(),
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             platform: None,
@@ -127,10 +157,10 @@ mod tests {
     // ----- shape -----
 
     #[test]
-    fn output_is_16_hex_chars() {
+    fn output_is_64_hex_chars() {
         let fp = derive(&ev_with_exception("E", "f", "a.js", 1));
         let s = fp.as_str();
-        assert_eq!(s.len(), 16);
+        assert_eq!(s.len(), 64);
         assert!(
             s.chars().all(|c| c.is_ascii_hexdigit()),
             "non-hex char: {s}"

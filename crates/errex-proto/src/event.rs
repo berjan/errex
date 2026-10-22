@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// Sentry SDKs send `timestamp` either as an RFC 3339 string or as a Unix
@@ -42,12 +43,12 @@ where
 
 /// A single error event coming from a Sentry-compatible SDK.
 ///
-/// We model only the fields the scaffold needs. Unknown fields are dropped
-/// rather than retained: `serde(deny_unknown_fields)` would be too strict for
-/// real SDK payloads, and a passthrough JSON blob would defeat the type. If
-/// raw payload preservation is needed, add a `raw: serde_json::Value` field.
+/// Typed indexing fields plus lossless SDK extensions at every stack level.
+/// Ingestion scrubs sensitive fields before constructing this value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
+    #[serde(flatten)]
+    pub additional: BTreeMap<String, Value>,
     #[serde(default = "Uuid::new_v4")]
     pub event_id: Uuid,
 
@@ -102,11 +103,9 @@ pub struct Event {
 }
 
 impl Event {
-    /// First exception in the chain, if any. Sentry payloads put the
-    /// most-derived (innermost) exception last by convention; we leave that
-    /// ordering to callers.
+    /// SDK exception chains put the most recent exception last.
     pub fn primary_exception(&self) -> Option<&ExceptionInfo> {
-        self.exception.as_ref().and_then(|c| c.values.first())
+        self.exception.as_ref().and_then(|c| c.values.last())
     }
 
     /// Convenient title used by the issue grouper and TUI.
@@ -120,9 +119,23 @@ impl Event {
             }
         } else if let Some(msg) = &self.message {
             msg.clone()
+        } else if let Some(msg) = self.log_message(false) {
+            msg.to_string()
         } else {
             "Unknown event".to_string()
         }
+    }
+
+    pub fn log_message(&self, template: bool) -> Option<&str> {
+        let entry = self.additional.get("logentry")?;
+        let fields = if template {
+            ["message", "formatted"]
+        } else {
+            ["formatted", "message"]
+        };
+        fields
+            .into_iter()
+            .find_map(|key| entry.get(key).and_then(Value::as_str))
     }
 }
 
@@ -139,12 +152,16 @@ pub enum Level {
 /// Sentry wraps exceptions in `{ "values": [...] }`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExceptionContainer {
+    #[serde(flatten)]
+    pub additional: BTreeMap<String, Value>,
     #[serde(default)]
     pub values: Vec<ExceptionInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExceptionInfo {
+    #[serde(flatten)]
+    pub additional: BTreeMap<String, Value>,
     #[serde(rename = "type", default)]
     pub ty: Option<String>,
 
@@ -162,18 +179,28 @@ impl ExceptionInfo {
     pub fn first_frame(&self) -> Option<&Frame> {
         // Sentry orders frames oldest-first; the "first interesting" frame is
         // typically the last one in the list.
-        self.stacktrace.as_ref().and_then(|s| s.frames.last())
+        self.stacktrace.as_ref().and_then(|s| {
+            s.frames
+                .iter()
+                .rev()
+                .find(|f| f.in_app == Some(true))
+                .or_else(|| s.frames.last())
+        })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stacktrace {
+    #[serde(flatten)]
+    pub additional: BTreeMap<String, Value>,
     #[serde(default)]
     pub frames: Vec<Frame>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
+    #[serde(flatten)]
+    pub additional: BTreeMap<String, Value>,
     #[serde(default)]
     pub filename: Option<String>,
 

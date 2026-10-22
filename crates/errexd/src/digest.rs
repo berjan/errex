@@ -10,7 +10,7 @@
 
 use chrono::{DateTime, Utc};
 use errex_proto::{Event, Fingerprint, Level, ServerMessage};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::error::DaemonError;
 use crate::fingerprint;
@@ -18,7 +18,7 @@ use crate::store::{BatchUpsertInput, Store, UpsertResult};
 use crate::webhook;
 
 /// Max events per digest batch. The single-COMMIT-per-batch is what makes
-/// batching worth it under WAL+synchronous=NORMAL: one fsync amortized
+/// batching worth it under WAL+synchronous=FULL: one fsync amortized
 /// over up to N events.
 ///
 /// Stress-tested at 32 — increasing it bumps the saturation throughput
@@ -33,8 +33,9 @@ const BATCH_SIZE: usize = 16;
 /// then only does SQLite I/O. Per-event JSON serialization showed up on
 /// the digest's hot path under saturation; moving it off the writer
 /// lifts the throughput plateau.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IngestEvent {
+    pub committed: Option<oneshot::Sender<Result<(), ()>>>,
     pub project: String,
     pub fingerprint: Fingerprint,
     pub title: String,
@@ -92,6 +93,7 @@ pub fn prepare(project: String, event: Event) -> IngestEvent {
         serde_json::to_string(&event).expect("Event always serializes (no non-string map keys)");
 
     IngestEvent {
+        committed: None,
         project,
         fingerprint,
         title,
@@ -144,8 +146,8 @@ pub async fn run(
 
 /// Persist a batch of `IngestEvent`s under one transaction, then broadcast
 /// one ServerMessage per result. Empties `buf` when done. Per-batch DB
-/// errors are logged and the batch is dropped — the next batch starts
-/// fresh, the digest task does not exit on transient SQLite errors.
+/// errors close the acknowledgment channels: callers receive 503, never a
+/// false success. The digest remains available for subsequent requests.
 async fn process_batch(
     store: &Store,
     fanout: &broadcast::Sender<ServerMessage>,
@@ -181,7 +183,10 @@ async fn process_batch(
         }
     };
 
-    for (rec, result) in buf.iter().zip(results) {
+    for (rec, result) in buf.iter_mut().zip(results) {
+        if let Some(ack) = rec.committed.take() {
+            let _ = ack.send(Ok(()));
+        }
         if result.regressed {
             tracing::warn!(
                 project = %rec.project,

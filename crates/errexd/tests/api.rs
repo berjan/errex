@@ -106,7 +106,7 @@ async fn fixture_full(
     let state = Arc::new(AppState {
         events: tx,
         store: store.clone(),
-        fanout: fanout_tx,
+        fanout: fanout_tx.clone(),
         require_auth,
         rate_limiter: Arc::new(rate_limit::RateLimiter::new(
             rate_limit_per_min,
@@ -123,19 +123,94 @@ async fn fixture_full(
         trust_proxy_headers: true,
         metrics: Arc::new(metrics::Metrics::new()),
         webhook_capacity: 8,
-        webhook_sender: webhook_tx,
+        webhook_sender: webhook_tx.clone(),
     });
     let router = ingest::build_router(state);
-    tokio::spawn(async move {
-        let mut rx = rx;
-        while rx.recv().await.is_some() {}
-    });
+    tokio::spawn(digest::run(store.clone(), rx, fanout_tx, webhook_tx));
     (router, store, dir)
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn migration_ingest_success_means_event_is_committed() {
+    let (router, store, _dir) = fixture().await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/123/envelope/")
+                .body(Body::from(
+                    "{}\n{\"type\":\"event\"}\n{\"message\":\"commit-check\"}\n",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let issues = store.list_issues_by_project("123").await.unwrap();
+    assert_eq!(
+        issues.len(),
+        1,
+        "200 must mean committed, not merely queued"
+    );
+    assert!(store.latest_event(issues[0].id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn migration_retry_is_idempotent() {
+    let (router, store, _dir) = fixture().await;
+    let payload = "{}\n{\"type\":\"event\"}\n{\"event_id\":\"12345678123456781234567812345678\",\"message\":\"retry\"}\n";
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/123/envelope/")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let issues = store.list_issues_by_project("123").await.unwrap();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(
+        issues[0].event_count, 1,
+        "SDK retries must not inflate counts"
+    );
+}
+
+#[tokio::test]
+async fn migration_database_failure_is_not_acknowledged() {
+    let (router, store, dir) = fixture().await;
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("errex.db").display()))
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE events").execute(&db).await.unwrap();
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/123/envelope/")
+                .body(Body::from(
+                    "{}\n{\"type\":\"event\"}\n{\"message\":\"storage-failure\"}\n",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(store
+        .list_issues_by_project("123")
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 // ----- /metrics -----
@@ -536,6 +611,78 @@ async fn put_status_rejects_viewer_role_with_403() {
 }
 
 // ----- DSN auth -----
+
+#[tokio::test]
+async fn migration_rejects_nonstandard_large_window_brotli() {
+    let (router, _store, _dir) = fixture().await;
+    // Same canary with the non-RFC large-window extension header.
+    let body = vec![
+        17, 86, 188, 0, 0, 16, 221, 230, 239, 115, 197, 158, 211, 239, 179, 240, 8, 194, 66, 36,
+        16, 177, 36, 178, 40, 206, 172, 166, 66, 228, 83, 48, 244, 171, 5, 154, 10, 232, 32, 96,
+        76, 191, 113, 246, 88, 98, 226, 137, 38, 0,
+    ];
+    let res = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/123/envelope/")
+                .header("content-encoding", "br")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn migration_accepts_brotli_sdk_envelopes() {
+    let (router, store, _dir) = fixture().await;
+    // Python SDK's Brotli quality=4 encoding of a synthetic envelope.
+    let body = vec![
+        27, 47, 0, 0, 68, 183, 249, 251, 92, 177, 231, 244, 251, 44, 60, 130, 176, 16, 9, 68, 44,
+        137, 44, 138, 51, 171, 169, 16, 249, 20, 12, 253, 106, 129, 166, 2, 58, 8, 24, 211, 111,
+        156, 61, 150, 152, 120, 162, 9,
+    ];
+    let res = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/123/envelope/")
+                .header("content-encoding", "br")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        store.list_issues_by_project("123").await.unwrap()[0].title,
+        "brotli canary"
+    );
+}
+
+#[tokio::test]
+async fn migration_rejects_brotli_bomb() {
+    let (router, _store, _dir) = fixture().await;
+    let body = vec![
+        203, 255, 255, 63, 0, 36, 240, 226, 177, 64, 114, 239, 255, 0, 0, 16, 120, 3,
+    ];
+    let res = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/123/envelope/")
+                .header("content-encoding", "br")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"invalid compressed envelope");
+}
 
 fn sample_envelope_body() -> Body {
     let now = chrono::Utc::now().to_rfc3339();
@@ -1278,6 +1425,7 @@ async fn seed_one_event(store: &Store, project: &str, fingerprint: &str) -> i64 
         .await
         .unwrap();
     let ev = Event {
+        additional: Default::default(),
         event_id: uuid::Uuid::new_v4(),
         timestamp: Utc::now(),
         platform: Some("javascript".into()),

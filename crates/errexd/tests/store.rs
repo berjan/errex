@@ -30,6 +30,52 @@ mod store;
 
 use store::{BatchUpsertInput, RetentionSettings, Role, StorageStats, Store};
 
+#[tokio::test]
+async fn migration_alert_outbox_is_durable_and_retryable() {
+    let (store, dir) = fresh_store().await;
+    store.create_project("123").await.unwrap();
+    store
+        .set_project_webhook("123", Some("https://example.com/hook"))
+        .await
+        .unwrap();
+    let fingerprint = fp("alert");
+    let input = BatchUpsertInput {
+        project: "123",
+        fp: &fingerprint,
+        title: "test",
+        culprit: None,
+        level: Some("error"),
+        now: Utc::now(),
+        event_id: "alert-test",
+        payload: "{}",
+    };
+    store.upsert_batch_with_events(&[input]).await.unwrap();
+    let reopened = Store::open(&dir.join("errex.db")).await.unwrap();
+    let pending = reopened.pending_webhooks().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let id = pending[0].id;
+    assert!(reopened
+        .get_issue(pending[0].issue_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(reopened.get_issue(i64::MAX).await.unwrap().is_none());
+    reopened.retry_webhook(id).await.unwrap();
+    assert!(reopened.pending_webhooks().await.unwrap().is_empty());
+    let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM webhook_outbox WHERE id = ?")
+        .bind(id)
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+    assert_eq!(attempts, 1);
+    reopened.complete_webhook(id).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM webhook_outbox")
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
 // ----- helpers -----
 
 fn unique_tempdir() -> PathBuf {
@@ -60,6 +106,7 @@ async fn fresh_store() -> (Store, PathBuf) {
 
 fn sample_event(ty: &str, value: &str, function: &str, lineno: u32) -> Event {
     Event {
+        additional: Default::default(),
         event_id: Uuid::new_v4(),
         timestamp: Utc::now(),
         platform: Some("javascript".into()),
@@ -69,12 +116,16 @@ fn sample_event(ty: &str, value: &str, function: &str, lineno: u32) -> Event {
         server_name: None,
         message: None,
         exception: Some(ExceptionContainer {
+            additional: Default::default(),
             values: vec![ExceptionInfo {
+                additional: Default::default(),
                 ty: Some(ty.into()),
                 value: Some(value.into()),
                 module: None,
                 stacktrace: Some(Stacktrace {
+                    additional: Default::default(),
                     frames: vec![Frame {
+                        additional: Default::default(),
                         filename: Some("app.js".into()),
                         function: Some(function.into()),
                         module: None,
@@ -547,12 +598,12 @@ async fn open_applies_perf_pragmas() {
     // 0 = default, 1 = file, 2 = memory.
     assert_eq!(temp.0, 2, "temp_store should be MEMORY");
 
-    // synchronous=OFF (0) — fsync skipped on COMMIT and checkpoint.
+    // FULL (2) ensures an acknowledged event survives a host power loss.
     let sync: (i64,) = sqlx::query_as("PRAGMA synchronous")
         .fetch_one(store.pool())
         .await
         .expect("read synchronous");
-    assert_eq!(sync.0, 0, "synchronous should be OFF (0)");
+    assert_eq!(sync.0, 2, "synchronous should be FULL (2)");
 }
 
 #[tokio::test]

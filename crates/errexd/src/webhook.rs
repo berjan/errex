@@ -2,9 +2,8 @@
 //!
 //! The digest task pushes `Trigger`s onto an mpsc channel; this task drains
 //! them, looks up the project's webhook URL, and POSTs a Slack/Discord/Teams-
-//! compatible JSON payload. Failures are logged and dropped — webhook
-//! delivery is best-effort, not transactional. (If you need durable
-//! delivery, fan out to your own queue.)
+//! compatible JSON payload. A transactional SQLite outbox holds failed
+//! deliveries across restarts with capped exponential retry backoff.
 //!
 //! Lightweight: a single shared hyper Client (HTTP/1, rustls + webpki-roots,
 //! ring crypto) and one task. No reqwest — the builder/multipart/cookie/
@@ -14,7 +13,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Method, Request};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -72,9 +71,8 @@ async fn post_json(client: &WebhookClient, url: &str, body: &Value) -> Result<u1
         Err(_) => return Err("timeout".into()),
     };
     let status = resp.status().as_u16();
-    // Drain the body so the connection can be reused. Best-effort —
-    // we don't surface body content anywhere.
-    let _ = resp.into_body().collect().await;
+    // Status is sufficient; never buffer an untrusted response body.
+    drop(resp); // Never buffer an untrusted webhook response body.
     Ok(status)
 }
 
@@ -221,74 +219,65 @@ pub fn build_payload(t: &Trigger, public_url: &str) -> Value {
     })
 }
 
-/// Spawned task. Reads triggers, drops them silently for muted/ignored
-/// issues, looks up the project's webhook URL, fires the POST.
+/// The channel only wakes the worker; SQLite is the durable queue.
 pub async fn run(store: Store, public_url: String, mut rx: mpsc::Receiver<Trigger>) {
-    // Hyper Client does not follow redirects on its own — that matches the
-    // SSRF policy: a 30x pointing at an internal address would re-do the
-    // pivot the configured-URL validator just refused. Followers can update
-    // their endpoint instead of relying on us to chase 302s.
     let client = build_client();
-
-    tracing::info!("webhook task started");
-    while let Some(trigger) = rx.recv().await {
-        // Don't notify on muted/ignored issues — that's the whole point of
-        // those statuses. Regression of a previously-resolved issue is
-        // explicitly NOT muted because the regression event already flipped
-        // it to unresolved before reaching here.
-        if matches!(
-            trigger.issue.status,
-            IssueStatus::Muted | IssueStatus::Ignored
-        ) {
-            continue;
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {},
+            trigger = rx.recv() => if trigger.is_none() { break; },
         }
-
-        let url = match store.project_by_name(&trigger.issue.project).await {
-            Ok(Some(p)) => p.webhook_url,
-            Ok(None) => None,
+        let pending = match store.pending_webhooks().await {
+            Ok(rows) => rows,
             Err(err) => {
-                tracing::warn!(%err, project = %trigger.issue.project, "webhook: project lookup failed");
+                tracing::error!(%err, "webhook outbox read failed");
                 continue;
             }
         };
-        let Some(url) = url else { continue };
-
-        let body = build_payload(&trigger, &public_url);
-        let res = post_json(&client, &url, &body).await;
-        // Surface the most recent delivery outcome on the project row so the
-        // /projects/[name] console can render "last delivery: 200 · 12s ago"
-        // (or 404, or "never delivered") without a separate history table.
-        // Status 0 is the "transport failure" sentinel — see the migration.
-        let status_code = match &res {
-            Ok(code) => *code,
-            Err(_) => 0,
-        };
-        store
-            .record_webhook_attempt(&trigger.issue.project, status_code)
+        for row in pending {
+            let result: Result<(), crate::error::DaemonError> = async {
+                let Some(issue) = store.get_issue(row.issue_id).await? else {
+                    return store.complete_webhook(row.id).await;
+                };
+                if matches!(issue.status, IssueStatus::Muted | IssueStatus::Ignored) {
+                    return store.complete_webhook(row.id).await;
+                }
+                let url = store
+                    .project_by_name(&issue.project)
+                    .await?
+                    .and_then(|p| p.webhook_url);
+                let Some(url) = url else {
+                    return store.complete_webhook(row.id).await;
+                };
+                let trigger = Trigger {
+                    issue,
+                    kind: if row.kind == "new" {
+                        TriggerKind::NewIssue
+                    } else {
+                        TriggerKind::Regression
+                    },
+                };
+                let status = post_json(&client, &url, &build_payload(&trigger, &public_url))
+                    .await
+                    .unwrap_or(0);
+                store
+                    .record_webhook_attempt(&trigger.issue.project, status)
+                    .await;
+                if (200..300).contains(&status) {
+                    store.complete_webhook(row.id).await?;
+                } else {
+                    store.retry_webhook(row.id).await?;
+                    tracing::warn!(issue_id = row.issue_id, status, "webhook queued for retry");
+                }
+                Ok(())
+            }
             .await;
-        match res {
-            Ok(code) if (200..300).contains(&code) => {
-                tracing::info!(
-                    project = %trigger.issue.project,
-                    issue_id = trigger.issue.id,
-                    kind = ?trigger.kind,
-                    "webhook delivered",
-                );
-            }
-            Ok(code) => {
-                tracing::warn!(
-                    project = %trigger.issue.project,
-                    issue_id = trigger.issue.id,
-                    status = code,
-                    "webhook returned non-2xx",
-                );
-            }
-            Err(err) => {
-                tracing::warn!(err, project = %trigger.issue.project, "webhook send failed");
+            if let Err(err) = result {
+                tracing::error!(%err, "webhook outbox delivery failed");
             }
         }
     }
-    tracing::info!("webhook task exiting");
 }
 
 #[cfg(test)]
@@ -526,10 +515,23 @@ mod tests {
 
     /// Build an Issue whose project name matches the one we'll create in the
     /// store, so the webhook task's project lookup succeeds.
-    fn issue_for(project: &str) -> Issue {
-        let mut i = issue();
-        i.project = project.to_string();
-        i
+    async fn issue_for(store: &Store, project: &str) -> Issue {
+        let fingerprint = Fingerprint::new("webhook-test");
+        store
+            .upsert_batch_with_events(&[crate::store::BatchUpsertInput {
+                project,
+                fp: &fingerprint,
+                title: "test",
+                culprit: None,
+                level: Some("error"),
+                now: Utc::now(),
+                event_id: "webhook-test",
+                payload: "{}",
+            }])
+            .await
+            .unwrap()
+            .remove(0)
+            .issue
     }
 
     /// Poll the project row up to 1s waiting for `last_webhook_status` to be
@@ -558,7 +560,7 @@ mod tests {
         let task = tokio::spawn(run(store.clone(), "http://example".into(), rx));
 
         tx.send(Trigger {
-            issue: issue_for("p"),
+            issue: issue_for(&store, "p").await,
             kind: TriggerKind::NewIssue,
         })
         .await
@@ -583,7 +585,7 @@ mod tests {
         let task = tokio::spawn(run(store.clone(), "http://example".into(), rx));
 
         tx.send(Trigger {
-            issue: issue_for("p"),
+            issue: issue_for(&store, "p").await,
             kind: TriggerKind::NewIssue,
         })
         .await
@@ -617,7 +619,7 @@ mod tests {
         let task = tokio::spawn(run(store.clone(), "http://example".into(), rx));
 
         tx.send(Trigger {
-            issue: issue_for("p"),
+            issue: issue_for(&store, "p").await,
             kind: TriggerKind::NewIssue,
         })
         .await
@@ -659,7 +661,7 @@ mod tests {
         let task = tokio::spawn(run(store.clone(), "http://example".into(), rx));
 
         tx.send(Trigger {
-            issue: issue_for("p"),
+            issue: issue_for(&store, "p").await,
             kind: TriggerKind::NewIssue,
         })
         .await

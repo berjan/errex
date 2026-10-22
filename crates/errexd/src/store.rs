@@ -194,20 +194,46 @@ pub struct StoredEvent {
     pub payload: serde_json::Value,
 }
 
+#[derive(sqlx::FromRow)]
+pub struct PendingWebhook {
+    pub id: i64,
+    pub issue_id: i64,
+    pub kind: String,
+}
+
 impl Store {
+    pub async fn pending_webhooks(&self) -> Result<Vec<PendingWebhook>, DaemonError> {
+        Ok(sqlx::query_as("SELECT id, issue_id, kind FROM webhook_outbox WHERE next_attempt <= unixepoch() ORDER BY id LIMIT 16")
+            .fetch_all(&self.pool).await?)
+    }
+
+    pub async fn complete_webhook(&self, id: i64) -> Result<(), DaemonError> {
+        sqlx::query("DELETE FROM webhook_outbox WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn retry_webhook(&self, id: i64) -> Result<(), DaemonError> {
+        sqlx::query("UPDATE webhook_outbox SET attempts = attempts + 1, next_attempt = unixepoch() + min(3600, 5 * (1 << min(attempts, 10))) WHERE id = ?")
+            .bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn get_issue(&self, id: i64) -> Result<Option<Issue>, DaemonError> {
+        let row: Option<IssueRow> = sqlx::query_as("SELECT id, project, fingerprint, title, culprit, level, status, event_count, first_seen, last_seen FROM issues WHERE id = ?")
+            .bind(id).fetch_optional(&self.pool).await?;
+        Ok(row.map(Into::into))
+    }
     pub async fn open(db_path: &Path) -> Result<Self, DaemonError> {
         // WAL gives us non-blocking readers alongside the single writer task.
-        // `synchronous=NORMAL` is the standard pairing with WAL: durable across
-        // app crashes, only loses writes on a host power loss.
+        // FULL syncs each commit before HTTP success, including on power loss.
         //
         // Pragma choices are tuned for "minimum hosting RAM" — the
         // load-bearing cost on Railway / Fly / similar.
         //
-        // `synchronous = OFF`: skip COMMIT and checkpoint fsyncs. WAL
-        //   recovery still preserves all committed data on a daemon
-        //   crash; only host power loss can drop up to one
-        //   transaction. SDKs already retry, so this trade is fine for
-        //   an error tracker.
+        // We do not trade accepted events for synthetic benchmark throughput.
         //
         // `mmap_size = 16 MB`: virtual mapping window. Default sqlx is
         //   0 (no mmap). 16 MB is enough for hot index pages on a
@@ -232,7 +258,7 @@ impl Store {
             .filename(db_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Off)
+            .synchronous(SqliteSynchronous::Full)
             .busy_timeout(std::time::Duration::from_millis(5000))
             .pragma("wal_autocheckpoint", "1000")
             .pragma("mmap_size", "0")
@@ -384,10 +410,36 @@ impl Store {
         &self,
         batch: &[BatchUpsertInput<'_>],
     ) -> Result<Vec<UpsertResult>, DaemonError> {
-        let mut tx = self.pool.begin().await?;
+        // Acquire the write lock before reading deduplication state. A
+        // deferred read->write upgrade can fail immediately with BUSY.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut results = Vec::with_capacity(batch.len());
 
         for input in batch {
+            // A response can be lost after COMMIT. Replaying the same SDK
+            // event must not increment counts or re-fire regression alerts.
+            let existing: Option<IssueRow> = sqlx::query_as(
+                "SELECT i.id, i.project, i.fingerprint, i.title, i.culprit, i.level, i.status, \
+                 i.event_count, i.first_seen, i.last_seen FROM issues i \
+                 JOIN events e ON e.issue_id = i.id WHERE e.event_id = ?",
+            )
+            .bind(input.event_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(row) = existing {
+                if row.project != input.project {
+                    return Err(errex_proto::ProtoError::InvalidEnvelope(
+                        "event id belongs to another project".into(),
+                    )
+                    .into());
+                }
+                results.push(UpsertResult {
+                    issue: row.into(),
+                    created: false,
+                    regressed: false,
+                });
+                continue;
+            }
             let fp_str = input.fp.as_str();
             // Bind `DateTime<Utc>` directly via sqlx's chrono integration;
             // saves the per-event RFC3339 String allocation that
@@ -476,6 +528,12 @@ impl Store {
                 created,
                 regressed,
             });
+            if created || regressed {
+                let issue = &results.last().expect("just pushed result").issue;
+                sqlx::query("INSERT INTO webhook_outbox(issue_id, kind) SELECT ?, ? WHERE EXISTS (SELECT 1 FROM projects WHERE name = ? AND webhook_url IS NOT NULL)")
+                    .bind(issue.id).bind(if created { "new" } else { "regression" })
+                    .bind(input.project).execute(&mut *tx).await?;
+            }
         }
 
         tx.commit().await?;
@@ -1420,6 +1478,23 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn migration_commits_are_fsynced() {
+        let dir = std::env::temp_dir().join(format!("errex-sync-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("test.db")).await.unwrap();
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(sync, 2, "SQLite FULL durability required");
     }
 }
 

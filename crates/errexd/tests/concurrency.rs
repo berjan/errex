@@ -55,6 +55,7 @@ fn unique_tempdir() -> PathBuf {
 
 fn sample_event(fp_seed: u64) -> Event {
     Event {
+        additional: Default::default(),
         event_id: Uuid::new_v4(),
         timestamp: Utc::now(),
         platform: Some("javascript".into()),
@@ -64,12 +65,16 @@ fn sample_event(fp_seed: u64) -> Event {
         server_name: None,
         message: None,
         exception: Some(ExceptionContainer {
+            additional: Default::default(),
             values: vec![ExceptionInfo {
+                additional: Default::default(),
                 ty: Some("TypeError".into()),
                 value: Some(format!("err {fp_seed}")),
                 module: None,
                 stacktrace: Some(Stacktrace {
+                    additional: Default::default(),
                     frames: vec![Frame {
+                        additional: Default::default(),
                         function: Some("oops".into()),
                         filename: Some(format!("file{}.js", fp_seed % 10)),
                         module: None,
